@@ -1,7 +1,10 @@
 import { useMemo } from 'react';
 import { router, useNavigation } from 'expo-router';
 
+// Map existing screen names to Expo Router paths (powered by React Navigation).
 function targetFor(name, params = {}) {
+  if (['users', 'equipment', 'reservations', 'reports'].includes(name)) return `/(admin)/${name}`;
+  if (name === 'Admin') return '/(admin)';
   if (name === 'RoleSelect') return '/';
   if (name === 'Home') return '/(customer)';
   if (name === 'Equipment') return '/(customer)/equipment';

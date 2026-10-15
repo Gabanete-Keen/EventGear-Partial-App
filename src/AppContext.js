@@ -1,7 +1,9 @@
+import { Alert } from './feedback';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { useSQLiteContext } from 'expo-sqlite';
-import { getCustomerRentals, getEquipment } from './database';
+import { getCart, persistCart, getCustomerRentals, getEquipment } from './database';
 
+// Context shares SQLite-backed lists and cart state across nested screens.
 const AppContext = createContext(null);
 
 export function AppProvider({ children }) {
@@ -9,27 +11,38 @@ export function AppProvider({ children }) {
   const [equipment, setEquipment] = useState([]);
   const [rentals, setRentals] = useState([]);
   const [cart, setCart] = useState([]);
+  const [cartReady, setCartReady] = useState(false);
   const [bookingDraft, setBookingDraft] = useState(null);
 
   const refreshEquipment = useCallback(async () => {
-    setEquipment(await getEquipment(db));
+    try { setEquipment(await getEquipment(db)); } catch (error) { Alert.alert('Could not refresh equipment', error.message); }
   }, [db]);
 
   const refreshRentals = useCallback(async () => {
-    setRentals(await getCustomerRentals(db));
+    try { setRentals(await getCustomerRentals(db)); } catch (error) { Alert.alert('Could not refresh rentals', error.message); }
   }, [db]);
 
   useEffect(() => {
     let active = true;
-    Promise.all([getEquipment(db), getCustomerRentals(db)]).then(([nextEquipment, nextRentals]) => {
+    Promise.all([getEquipment(db), getCustomerRentals(db), getCart(db)]).then(([nextEquipment, nextRentals, savedCart]) => {
       if (!active) return;
       setEquipment(nextEquipment);
       setRentals(nextRentals);
-    });
+      setCart(savedCart);
+      setCartReady(true);
+    }).catch(error => Alert.alert('Could not load data', error.message));
     return () => { active = false; };
   }, [db]);
 
+  // Save cart changes to SQLite after initial hydration, so a restart retains them.
+  useEffect(() => {
+    if (cartReady) persistCart(db, cart).catch(error => Alert.alert('Could not save cart', error.message));
+  }, [db, cart, cartReady]);
+
   const addToCart = useCallback((item, quantity = 1) => {
+    if (!item.is_active || item.total_quantity < 1) throw new Error('This equipment is out of stock.');
+    const inCart = cart.find(row => row.equipment_id === item.equipment_id)?.quantity || 0;
+    if (inCart + quantity > item.total_quantity) throw new Error(`Only ${item.total_quantity} units are in stock; ${inCart} are already in your cart.`);
     setCart((current) => {
       const existing = current.find((row) => row.equipment_id === item.equipment_id);
       if (existing) {
@@ -41,7 +54,7 @@ export function AppProvider({ children }) {
       }
       return [...current, { ...item, quantity }];
     });
-  }, []);
+  }, [cart]);
 
   const updateCartQuantity = useCallback((equipmentId, quantity) => {
     setCart((current) =>

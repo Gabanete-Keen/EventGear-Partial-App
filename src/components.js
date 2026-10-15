@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   ActivityIndicator,
+  Image,
   Pressable,
   StyleSheet,
   Text,
@@ -8,6 +9,24 @@ import {
   View,
 } from 'react-native';
 import { colors, radius, shadow } from './theme';
+
+const equipmentImages = {
+  'Folding Tables': require('../assets/equipment images/Tables.png'),
+  'LED Party Lights': require('../assets/equipment images/Stage Lights.png'),
+  'Monobloc Chairs': require('../assets/equipment images/Chairs.png'),
+  'Pop-up Canopy Tent': require('../assets/equipment images/Tent.png'),
+  'Portable Projector': require('../assets/equipment images/Projector.png'),
+  'Premium Sound System': require('../assets/equipment images/Sound System.png'),
+};
+
+// Bundled photos work offline; new listings fall back to their chosen emoji.
+export function EquipmentImage({ item, style, fallbackStyle }) {
+  const source = equipmentImages[item.name];
+  if (!source) {
+    return <Text style={fallbackStyle}>{item.image_ref || '🎪'}</Text>;
+  }
+  return <Image source={source} accessibilityLabel={item.name} resizeMode="contain" style={[styles.equipmentImage, style]} />;
+}
 
 export function Money({ value, style }) {
   return (
@@ -43,6 +62,7 @@ export function PrimaryButton({ title, onPress, disabled, loading, variant = 'pr
   );
 }
 
+// Props let every form reuse the same labelled input and validation styling.
 export function Field({ label, error, multiline, style, containerStyle, ...props }) {
   return (
     <View style={[styles.fieldWrap, containerStyle]}>
@@ -75,7 +95,7 @@ export function EquipmentCard({ item, onPress, compact = false }) {
   return (
     <Pressable onPress={onPress} style={({ pressed }) => [styles.card, pressed && styles.pressed]}>
       <View style={[styles.emojiBox, compact && styles.emojiBoxCompact]}>
-        <Text style={compact ? styles.emojiCompact : styles.emoji}>{item.image_ref || '🎪'}</Text>
+        <EquipmentImage item={item} fallbackStyle={compact ? styles.emojiCompact : styles.emoji} />
       </View>
       <View style={styles.cardBody}>
         <Text style={styles.category}>{item.category}</Text>
@@ -155,13 +175,14 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     ...shadow,
   },
-  emojiBox: { width: 104, height: 112, borderRadius: 14, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
-  emojiBoxCompact: { width: 76, height: 82 },
+  emojiBox: { width: 104, height: 120, flexShrink: 0, overflow: 'hidden', borderRadius: 14, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
+  emojiBoxCompact: { width: 104, height: 112 },
   emoji: { fontSize: 47 },
+  equipmentImage: { width: '100%', height: '100%' },
   emojiCompact: { fontSize: 36 },
   cardBody: { flex: 1, paddingLeft: 14, justifyContent: 'center' },
   category: { color: colors.tealDark, fontSize: 11, fontWeight: '900', textTransform: 'uppercase', letterSpacing: 0.8 },
-  cardTitle: { color: colors.text, fontSize: 17, fontWeight: '800', marginTop: 4 },
+  cardTitle: { color: colors.text, fontSize: 16, fontWeight: '800', marginTop: 4 },
   priceRow: { flexDirection: 'row', alignItems: 'baseline', marginTop: 7 },
   money: { color: colors.navy, fontWeight: '900', fontSize: 16 },
   perDay: { color: colors.muted, fontSize: 12 },

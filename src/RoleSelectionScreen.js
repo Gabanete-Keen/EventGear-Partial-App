@@ -1,5 +1,6 @@
+import { SafeAreaView } from 'react-native-safe-area-context';
 import React from 'react';
-import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { colors, radius, shadow } from './theme';
 
 const roles = [
@@ -21,8 +22,8 @@ const roles = [
     key: 'Admin',
     icon: '🛡️',
     title: 'Administrator',
-    description: 'Planned for the next project phase.',
-    active: false,
+    description: 'Monitor bookings, manage user records, and review system activity.',
+    active: true,
   },
 ];
 
@@ -30,19 +31,16 @@ export default function RoleSelectionScreen({ navigation }) {
   return (
     <SafeAreaView style={styles.safe}>
       <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.brandIcon}>
-          <Text style={styles.brandEmoji}>📅</Text>
-          <Text style={styles.caseEmoji}>🧳</Text>
-        </View>
+        <Image source={require('../assets/icon.png')} style={{ width: 90, height: 90, alignSelf: 'center', borderRadius: 24 }} accessibilityLabel="EventGear logo" />
         <Text style={styles.logo}>Event<Text style={styles.logoAccent}>Gear</Text></Text>
         <Text style={styles.tagline}>Event equipment rentals, made simple.</Text>
 
         <View style={styles.demoBadge}>
-          <Text style={styles.demoBadgeText}>CLASSROOM PROTOTYPE</Text>
+          <Text style={styles.demoBadgeText}>LOCAL RENTAL SYSTEM</Text>
         </View>
 
         <Text style={styles.heading}>Choose a demo role</Text>
-        <Text style={styles.subheading}>No password is required in this partial build.</Text>
+        <Text style={styles.subheading}>Local demonstration accounts • no sign-in required.</Text>
 
         {roles.map((role) => (
           <Pressable
@@ -74,7 +72,7 @@ export default function RoleSelectionScreen({ navigation }) {
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
-  content: { flexGrow: 1, padding: 24, paddingTop: 45 },
+  content: { width: '100%', maxWidth: 600, alignSelf: 'center', flexGrow: 1, padding: 24, paddingTop: 45 },
   brandIcon: { width: 82, height: 82, borderRadius: 24, backgroundColor: colors.navy, alignSelf: 'center', alignItems: 'center', justifyContent: 'center', position: 'relative', ...shadow },
   brandEmoji: { fontSize: 39 },
   caseEmoji: { fontSize: 23, position: 'absolute', right: 7, bottom: 6 },

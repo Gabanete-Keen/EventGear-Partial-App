@@ -7,6 +7,7 @@ const seedEquipment = [
   ['Portable Projector', 'Visual', 'Full HD projector with HDMI cable and portable screen.', 1800, 4, '🎥'],
 ];
 
+// Schema creation is idempotent: reopening the app preserves customer records.
 export async function initializeDatabase(db) {
   await db.execAsync(`
     PRAGMA journal_mode = WAL;
@@ -60,6 +61,18 @@ export async function initializeDatabase(db) {
       FOREIGN KEY (equipment_id) REFERENCES equipment(equipment_id)
     );
 
+    CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS audit_log (
+      audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      details TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS cart_items (
+      equipment_id INTEGER PRIMARY KEY,
+      quantity INTEGER NOT NULL CHECK(quantity > 0),
+      FOREIGN KEY (equipment_id) REFERENCES equipment(equipment_id) ON DELETE CASCADE
+    );
     CREATE INDEX IF NOT EXISTS idx_reservation_dates
       ON reservations(start_date, end_date, status);
     CREATE INDEX IF NOT EXISTS idx_reservation_items_equipment
@@ -89,7 +102,8 @@ export async function initializeDatabase(db) {
   );
 
   const existing = await db.getFirstAsync('SELECT COUNT(*) AS count FROM equipment');
-  if (existing.count === 0) {
+  const seeded = await db.getFirstAsync("SELECT value FROM app_settings WHERE key = 'seeded'");
+  if (existing.count === 0 && !seeded) {
     for (const item of seedEquipment) {
       await db.runAsync(
         `INSERT INTO equipment
@@ -100,8 +114,10 @@ export async function initializeDatabase(db) {
       );
     }
   }
+  await db.runAsync("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('seeded', '1')");
 }
 
+// Parameter binding keeps search text separate from executable SQL.
 export async function getEquipment(db, search = '', category = 'All') {
   const term = `%${search.trim()}%`;
   return db.getAllAsync(
@@ -125,90 +141,93 @@ export async function getEquipmentById(db, equipmentId) {
   );
 }
 
-export async function getAvailableQuantity(db, equipmentId, startDate, endDate) {
-  const row = await db.getFirstAsync(
-    `SELECT e.total_quantity - COALESCE(SUM(
-        CASE WHEN r.reservation_id IS NOT NULL THEN ri.quantity ELSE 0 END
-      ), 0) AS available
-     FROM equipment e
-     LEFT JOIN reservation_items ri ON ri.equipment_id = e.equipment_id
-     LEFT JOIN reservations r ON r.reservation_id = ri.reservation_id
-       AND r.status IN ('pending', 'confirmed')
-       AND r.start_date <= ?
-       AND r.end_date >= ?
-     WHERE e.equipment_id = ?
-     GROUP BY e.equipment_id`,
-    endDate,
-    startDate,
-    equipmentId
-  );
-  return Number(row?.available ?? 0);
+// Dates are canonical calendar dates, calculated in UTC to avoid DST rounding.
+export function validDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value || '') &&
+    Number.isFinite(Date.parse(`${value}T00:00:00Z`)) &&
+    new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+}
+export function localToday() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+export function rentalDays(startDate, endDate) {
+  if (!validDate(startDate) || !validDate(endDate)) return NaN;
+  return (Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86400000 + 1;
 }
 
-export function rentalDays(startDate, endDate) {
-  const start = new Date(`${startDate}T00:00:00`);
-  const end = new Date(`${endDate}T00:00:00`);
-  return Math.floor((end - start) / 86400000) + 1;
+// Use peak concurrent bookings, rather than summing reservations on different days.
+export async function getAvailableQuantity(db, equipmentId, startDate, endDate, excludeId = -1) {
+  const item = await getEquipmentById(db, equipmentId);
+  if (!item?.is_active) return 0;
+  const rows = await db.getAllAsync(
+    `SELECT r.start_date, r.end_date, ri.quantity FROM reservation_items ri
+     JOIN reservations r ON r.reservation_id = ri.reservation_id
+     WHERE ri.equipment_id = ? AND r.status IN ('pending', 'confirmed')
+       AND r.start_date <= ? AND r.end_date >= ? AND r.reservation_id != ?`,
+    equipmentId, endDate, startDate, excludeId
+  );
+  const points = [startDate, ...rows.map(r => r.start_date).filter(d => d >= startDate && d <= endDate)];
+  const peak = Math.max(0, ...points.map(day => rows.reduce((sum, r) =>
+    sum + (r.start_date <= day && r.end_date >= day ? r.quantity : 0), 0)));
+  return Math.max(0, item.total_quantity - peak);
+}
+
+// All write workflows share a queue. Validation and writes run inside the same
+// transaction so two fast submit taps cannot reserve the same remaining stock.
+let writeQueue = Promise.resolve();
+export function transaction(db, work) {
+  const task = writeQueue.then(async () => {
+    let result;
+    await db.withTransactionAsync(async () => { result = await work(); });
+    return result;
+  });
+  writeQueue = task.catch(() => {});
+  return task;
+}
+async function audit(db, action, details) {
+  await db.runAsync('INSERT INTO audit_log (action, details) VALUES (?, ?)', action, details);
 }
 
 export async function createReservation(db, booking) {
-  const days = rentalDays(booking.startDate, booking.endDate);
-  if (!Number.isFinite(days) || days < 1) {
-    throw new Error('Please enter a valid rental date range.');
-  }
-
-  for (const item of booking.items) {
-    const available = await getAvailableQuantity(
-      db,
-      item.equipment_id,
-      booking.startDate,
-      booking.endDate
-    );
-    if (item.quantity > available) {
-      throw new Error(`${item.name} only has ${available} available for those dates.`);
+  return transaction(db, async () => {
+    const days = rentalDays(booking.startDate, booking.endDate);
+    if (!Number.isFinite(days) || days < 1 || booking.startDate < localToday())
+      throw new Error('Choose valid rental dates starting today or later.');
+    if (!booking.contact?.trim()) throw new Error('Contact information is required.');
+    if (!booking.items?.length) throw new Error('Your cart is empty.');
+    if (!['Cash on pickup', 'GCash demonstration', 'Bank transfer demonstration'].includes(booking.paymentMethod))
+      throw new Error('Select a payment method.');
+    const seen = new Set();
+    const items = [];
+    for (const row of booking.items) {
+      if (seen.has(row.equipment_id)) throw new Error('Duplicate equipment in booking.');
+      seen.add(row.equipment_id);
+      if (!Number.isInteger(row.quantity) || row.quantity < 1) throw new Error('Quantity must be a positive whole number.');
+      const current = await getEquipmentById(db, row.equipment_id);
+      if (!current?.is_active) throw new Error('An item was removed. Please refresh your cart.');
+      if (Number(row.daily_rate) !== current.daily_rate) throw new Error(`${current.name} has a new price. Remove it from your cart and add it again.`);
+      const available = await getAvailableQuantity(db, row.equipment_id, booking.startDate, booking.endDate);
+      if (row.quantity > available) throw new Error(`${current.name} only has ${available} available for those dates.`);
+      items.push({ ...current, quantity: row.quantity });
     }
-  }
-
-  const total = booking.items.reduce(
-    (sum, item) => sum + item.daily_rate * item.quantity * days,
-    0
-  );
-  const bookingCode = `EG-${Date.now().toString().slice(-8)}`;
-  let reservationId;
-
-  await db.withTransactionAsync(async () => {
+    const total = Math.round(items.reduce((sum, item) => sum + item.daily_rate * item.quantity * days, 0) * 100) / 100;
+    const bookingCode = `EG-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
     const result = await db.runAsync(
-      `INSERT INTO reservations
-        (booking_code, customer_id, start_date, end_date, booking_contact,
-         event_note, status, demo_payment_method, demo_payment_status, total_amount)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 'recorded', ?)`,
-      bookingCode,
-      1,
-      booking.startDate,
-      booking.endDate,
-      booking.contact,
-      booking.note,
-      booking.paymentMethod,
-      total
+      `INSERT INTO reservations (booking_code, customer_id, start_date, end_date,
+       booking_contact, event_note, status, demo_payment_method, demo_payment_status, total_amount)
+       VALUES (?, 1, ?, ?, ?, ?, 'pending', ?, 'not_recorded', ?)`,
+      bookingCode, booking.startDate, booking.endDate, booking.contact.trim(), booking.note || '', booking.paymentMethod, total
     );
-    reservationId = result.lastInsertRowId;
-
-    for (const item of booking.items) {
-      const lineTotal = item.daily_rate * item.quantity * days;
-      await db.runAsync(
-        `INSERT INTO reservation_items
-          (reservation_id, equipment_id, quantity, daily_rate_at_booking, line_total)
-         VALUES (?, ?, ?, ?, ?)`,
-        reservationId,
-        item.equipment_id,
-        item.quantity,
-        item.daily_rate,
-        lineTotal
-      );
+    for (const item of items) {
+      await db.runAsync(`INSERT INTO reservation_items (reservation_id, equipment_id, quantity, daily_rate_at_booking, line_total)
+        VALUES (?, ?, ?, ?, ?)`, result.lastInsertRowId, item.equipment_id, item.quantity, item.daily_rate,
+        Math.round(item.daily_rate * item.quantity * days * 100) / 100);
     }
+    await db.runAsync('DELETE FROM cart_items');
+    await audit(db, 'Reservation created', bookingCode);
+    return { reservationId: result.lastInsertRowId, bookingCode, total };
   });
-
-  return { reservationId, bookingCode, total };
 }
 
 export async function getCustomerRentals(db) {
@@ -225,6 +244,7 @@ export async function getCustomerRentals(db) {
   );
 }
 
+// Separate parent and line-item reads reconstruct the saved booking receipt.
 export async function getRentalDetails(db, reservationId) {
   const reservation = await db.getFirstAsync(
     'SELECT * FROM reservations WHERE reservation_id = ?',
@@ -254,55 +274,103 @@ export async function getSupplierReservations(db) {
   );
 }
 
+// Terminal bookings cannot be reopened: released stock may already be booked.
+export function nextStatuses(status) {
+  return { pending: ['confirmed', 'cancelled'], confirmed: ['completed', 'cancelled'], completed: [], cancelled: [] }[status] || [];
+}
 export async function updateReservationStatus(db, reservationId, status) {
-  return db.runAsync(
-    'UPDATE reservations SET status = ? WHERE reservation_id = ?',
-    status,
-    reservationId
-  );
+  return transaction(db, async () => {
+    const r = await db.getFirstAsync('SELECT * FROM reservations WHERE reservation_id = ?', reservationId);
+    if (!r || !nextStatuses(r.status).includes(status)) throw new Error('This status change is no longer allowed. Refresh the reservation.');
+    if (status === 'completed' && r.end_date > localToday()) throw new Error('Complete the rental after its scheduled end date.');
+    await db.runAsync('UPDATE reservations SET status = ? WHERE reservation_id = ?', status, reservationId);
+    await audit(db, 'Reservation status', `${r.booking_code}: ${r.status} → ${status}`);
+  });
+}
+export async function updateReservationContact(db, reservationId, contact, note) {
+  if (!contact.trim()) throw new Error('Contact information is required.');
+  return transaction(db, async () => {
+    const r = await db.getFirstAsync('SELECT * FROM reservations WHERE reservation_id = ? AND customer_id = 1', reservationId);
+    if (!r || r.status !== 'pending') throw new Error('Only pending bookings can be edited.');
+    await db.runAsync('UPDATE reservations SET booking_contact = ?, event_note = ? WHERE reservation_id = ?', contact.trim(), note.trim(), reservationId);
+    await audit(db, 'Booking details edited', r.booking_code);
+  });
 }
 
 export async function saveEquipment(db, form, equipmentId) {
-  const values = [
-    form.name.trim(),
-    form.category.trim(),
-    form.description.trim(),
-    Number(form.dailyRate),
-    Number(form.totalQuantity),
-    form.imageRef || '🎪',
-  ];
-
-  if (equipmentId) {
-    return db.runAsync(
-      `UPDATE equipment SET
-        name = ?, category = ?, description = ?, daily_rate = ?,
-        total_quantity = ?, image_ref = ?
-       WHERE equipment_id = ?`,
-      ...values,
-      equipmentId
-    );
-  }
-
-  return db.runAsync(
-    `INSERT INTO equipment
-      (supplier_id, name, category, description, daily_rate, total_quantity, image_ref)
-     VALUES (2, ?, ?, ?, ?, ?, ?)`,
-    ...values
-  );
+  const rate = Number(form.dailyRate), stock = Number(form.totalQuantity);
+  if (!form.name.trim() || !form.category.trim() || !form.description.trim()) throw new Error('Complete all equipment details.');
+  if (!form.dailyRate.trim() || !Number.isFinite(rate) || rate < 0) throw new Error('Enter a valid daily rate.');
+  if (!form.totalQuantity.trim() || !Number.isInteger(stock) || stock < 0) throw new Error('Enter a nonnegative whole-number quantity.');
+  return transaction(db, async () => {
+    const values = [form.name.trim(), form.category.trim(), form.description.trim(), rate, stock, form.imageRef || '🎪'];
+    if (equipmentId) {
+      const old = await getEquipmentById(db, equipmentId);
+      if (!old?.is_active) throw new Error('This listing no longer exists.');
+      const available = await getAvailableQuantity(db, equipmentId, localToday(), '9999-12-31');
+      if (stock < old.total_quantity - available) throw new Error('Quantity cannot be lower than stock committed to current or future bookings.');
+      await db.runAsync(`UPDATE equipment SET name = ?, category = ?, description = ?, daily_rate = ?, total_quantity = ?, image_ref = ? WHERE equipment_id = ?`, ...values, equipmentId);
+    } else {
+      await db.runAsync(`INSERT INTO equipment (supplier_id, name, category, description, daily_rate, total_quantity, image_ref) VALUES (2, ?, ?, ?, ?, ?, ?)`, ...values);
+    }
+    await audit(db, equipmentId ? 'Equipment updated' : 'Equipment created', form.name.trim());
+  });
 }
 
 export async function deleteEquipment(db, equipmentId) {
-  const futureBooking = await db.getFirstAsync(
-    `SELECT COUNT(*) AS count
-     FROM reservation_items ri
-     JOIN reservations r ON r.reservation_id = ri.reservation_id
-     WHERE ri.equipment_id = ?
-       AND r.status IN ('pending', 'confirmed')
-       AND r.end_date >= date('now')`,
-    equipmentId
-  );
-  if (futureBooking.count > 0) {
-    throw new Error('This equipment has an active or future booking and cannot be removed.');
-  }
-  return db.runAsync('DELETE FROM equipment WHERE equipment_id = ?', equipmentId);
+  return transaction(db, async () => {
+    const booked = await db.getFirstAsync(`SELECT COUNT(*) AS count FROM reservation_items ri
+      JOIN reservations r ON r.reservation_id = ri.reservation_id WHERE ri.equipment_id = ?
+      AND r.status IN ('pending', 'confirmed')`, equipmentId);
+    if (booked.count) throw new Error('This equipment has an active booking and cannot be removed.');
+    const history = await db.getFirstAsync('SELECT COUNT(*) AS count FROM reservation_items WHERE equipment_id = ?', equipmentId);
+    // Archive historical listings to keep receipts and foreign keys intact;
+    // unreferenced listings are physically deleted (the required DELETE operation).
+    await db.runAsync(history.count ? 'UPDATE equipment SET is_active = 0 WHERE equipment_id = ?' : 'DELETE FROM equipment WHERE equipment_id = ?', equipmentId);
+    await audit(db, history.count ? 'Equipment archived' : 'Equipment deleted', `Equipment #${equipmentId}`);
+  });
+}
+export async function getUsers(db) { return db.getAllAsync('SELECT * FROM users ORDER BY user_id'); }
+export async function saveUser(db, form, id) {
+  if (!form.name.trim() || !form.contact.trim()) throw new Error('Name and contact are required.');
+  if (!['customer', 'supplier', 'admin'].includes(form.role)) throw new Error('Select a valid role.');
+  return transaction(db, async () => {
+    if (id && Number(id) <= 3) {
+      const old = await db.getFirstAsync('SELECT * FROM users WHERE user_id = ?', id);
+      if (form.role !== old.role) throw new Error('The three demo account roles are fixed.');
+    }
+    if (id) await db.runAsync('UPDATE users SET name = ?, contact = ?, role = ? WHERE user_id = ?', form.name.trim(), form.contact.trim(), form.role, id);
+    else await db.runAsync('INSERT INTO users (name, contact, role) VALUES (?, ?, ?)', form.name.trim(), form.contact.trim(), form.role);
+    await audit(db, id ? 'User updated' : 'User created', form.name.trim());
+  });
+}
+export async function deleteUser(db, id) {
+  if (Number(id) <= 3) throw new Error('The demo accounts are required and cannot be deleted.');
+  return transaction(db, async () => {
+    const refs = await db.getFirstAsync(`SELECT (SELECT COUNT(*) FROM equipment WHERE supplier_id = ?) +
+      (SELECT COUNT(*) FROM reservations WHERE customer_id = ?) AS count`, id, id);
+    if (refs.count) throw new Error('This user has linked records and cannot be deleted.');
+    await db.runAsync('DELETE FROM users WHERE user_id = ?', id);
+    await audit(db, 'User deleted', `User #${id}`);
+  });
+}
+export async function getAdminOverview(db) {
+  const stats = await db.getFirstAsync(`SELECT
+    (SELECT COUNT(*) FROM users) AS users,
+    (SELECT COUNT(*) FROM equipment WHERE is_active = 1) AS equipment,
+    (SELECT COUNT(*) FROM reservations WHERE status = 'pending') AS pending,
+    (SELECT COUNT(*) FROM reservations) AS reservations,
+    (SELECT COALESCE(SUM(total_amount), 0) FROM reservations WHERE status IN ('confirmed','completed')) AS value`);
+  const statuses = await db.getAllAsync('SELECT status, COUNT(*) AS count, SUM(total_amount) AS total FROM reservations GROUP BY status');
+  const activity = await db.getAllAsync('SELECT * FROM audit_log ORDER BY audit_id DESC LIMIT 50');
+  return { stats, statuses, activity };
+}
+export async function getCart(db) {
+  return db.getAllAsync('SELECT e.*, c.quantity FROM cart_items c JOIN equipment e ON e.equipment_id = c.equipment_id WHERE e.is_active = 1');
+}
+export async function persistCart(db, items) {
+  return transaction(db, async () => {
+    await db.runAsync('DELETE FROM cart_items');
+    for (const item of items) await db.runAsync('INSERT INTO cart_items (equipment_id, quantity) VALUES (?, ?)', item.equipment_id, item.quantity);
+  });
 }

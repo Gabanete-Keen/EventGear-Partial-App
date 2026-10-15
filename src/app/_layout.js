@@ -5,6 +5,8 @@ import { StatusBar } from 'expo-status-bar';
 import { SQLiteProvider } from 'expo-sqlite';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AppProvider } from '../AppContext';
+import { FeedbackHost } from '../feedback';
+import DatabaseGate from '../DatabaseGate';
 import { initializeDatabase } from '../database';
 import { colors } from '../theme';
 
@@ -45,6 +47,7 @@ function Navigation() {
         <Stack.Screen name="index" options={{ headerShown: false }} />
         <Stack.Screen name="(customer)" options={{ headerShown: false }} />
         <Stack.Screen name="(supplier)" options={{ headerShown: false }} />
+        <Stack.Screen name="(admin)" options={{ headerShown: false }} />
         <Stack.Screen name="equipment-details" options={{ title: 'Equipment Details' }} />
         <Stack.Screen name="booking" options={{ title: 'Booking' }} />
         <Stack.Screen name="checkout" options={{ title: 'Checkout' }} />
@@ -59,13 +62,16 @@ function Navigation() {
 export default function RootLayout() {
   return (
     <SafeAreaProvider>
-      <Suspense fallback={<LoadingScreen />}>
-        <SQLiteProvider databaseName="eventgear.db" onInit={initializeDatabase} useSuspense>
-          <AppProvider>
-            <Navigation />
-          </AppProvider>
-        </SQLiteProvider>
-      </Suspense>
+      <DatabaseGate>
+        <Suspense fallback={<LoadingScreen />}>
+          <SQLiteProvider databaseName="eventgear.db" onInit={initializeDatabase} useSuspense>
+            <AppProvider>
+              <Navigation />
+              <FeedbackHost />
+            </AppProvider>
+          </SQLiteProvider>
+        </Suspense>
+      </DatabaseGate>
     </SafeAreaProvider>
   );
 }

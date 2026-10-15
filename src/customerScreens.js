@@ -1,10 +1,10 @@
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Alert } from './feedback';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Alert,
   FlatList,
   Pressable,
   RefreshControl,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -20,10 +20,15 @@ import {
   getEquipmentById,
   getRentalDetails,
   rentalDays,
+  validDate,
+  localToday,
+  updateReservationContact,
+  updateReservationStatus,
 } from './database';
 import {
   EmptyState,
   EquipmentCard,
+  EquipmentImage,
   Field,
   Money,
   PrimaryButton,
@@ -41,14 +46,15 @@ function screenTitle(navigation, title) {
 }
 
 export function CustomerHomeScreen({ navigation }) {
-  const { equipment, rentals } = useApp();
+  const { equipment, rentals, refreshEquipment, refreshRentals } = useApp();
+  useFocusEffect(useCallback(() => { Promise.all([refreshEquipment(), refreshRentals()]).catch(error => Alert.alert('Could not refresh', error.message)); }, [refreshEquipment, refreshRentals]));
   const active = rentals.filter((r) => ['pending', 'confirmed'].includes(r.status));
 
   return (
     <ScrollView style={styles.page} contentContainerStyle={styles.pageContent}>
       <View style={styles.hero}>
         <View style={styles.heroTop}>
-          <View>
+          <View style={{ flex: 1 }}>
             <Text style={styles.heroEyebrow}>WELCOME TO EVENTGEAR</Text>
             <Text style={styles.heroTitle}>Plan the event.{`\n`}Rent the gear.</Text>
           </View>
@@ -84,7 +90,7 @@ export function EquipmentListScreen({ navigation }) {
   const categories = ['All', 'Audio', 'Lighting', 'Furniture', 'Tents', 'Visual'];
 
   const load = useCallback(async () => {
-    setItems(await getEquipment(db, search, category));
+    try { setItems(await getEquipment(db, search, category)); } catch (error) { Alert.alert('Could not load equipment', error.message); }
   }, [db, search, category]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
@@ -122,20 +128,21 @@ export function EquipmentListScreen({ navigation }) {
 export function EquipmentDetailsScreen({ navigation, route }) {
   const { db, addToCart } = useApp();
   const [item, setItem] = useState(null);
+  const [loaded, setLoaded] = useState(false);
   const [quantity, setQuantity] = useState(1);
 
   useEffect(() => {
     getEquipmentById(db, route.params.equipmentId).then((row) => {
       setItem(row);
       if (row) screenTitle(navigation, row.name);
-    });
+    }).catch(error => Alert.alert('Could not load equipment', error.message)).finally(() => setLoaded(true));
   }, [db, navigation, route.params.equipmentId]);
 
-  if (!item) return <View style={styles.center}><Text>Loading equipment...</Text></View>;
+  if (!item) return <EmptyState title={loaded ? 'Equipment not found' : 'Loading equipment…'} message={loaded ? 'This listing may have been removed.' : 'Please wait.'} action={loaded ? 'Go back' : undefined} onAction={() => navigation.goBack()} />;
 
   return (
     <ScrollView style={styles.page} contentContainerStyle={styles.detailsContent}>
-      <View style={styles.detailsVisual}><Text style={styles.detailsEmoji}>{item.image_ref || '🎪'}</Text></View>
+      <View style={styles.detailsVisual}><EquipmentImage item={item} fallbackStyle={styles.detailsEmoji} /></View>
       <Text style={styles.detailsCategory}>{item.category}</Text>
       <Text style={styles.detailsTitle}>{item.name}</Text>
       <View style={styles.priceLine}><Money value={item.daily_rate} style={{ fontSize: 24 }} /><Text style={styles.perDayLarge}> per day</Text></View>
@@ -144,7 +151,7 @@ export function EquipmentDetailsScreen({ navigation, route }) {
       <View style={styles.infoBox}>
         <View><Text style={styles.infoLabel}>Local stock</Text><Text style={styles.infoValue}>{item.total_quantity} units</Text></View>
         <View style={styles.infoDivider} />
-        <View><Text style={styles.infoLabel}>Database</Text><Text style={styles.infoValue}>SQLite</Text></View>
+        <View><Text style={styles.infoLabel}>Availability</Text><Text style={styles.infoValue}>Checked at booking</Text></View>
       </View>
 
       <Text style={styles.fieldHeading}>Quantity</Text>
@@ -156,9 +163,10 @@ export function EquipmentDetailsScreen({ navigation, route }) {
 
       <PrimaryButton
         title={`Add ${quantity} to cart`}
+        disabled={!item.is_active || item.total_quantity < 1}
         onPress={() => {
-          addToCart(item, quantity);
-          Alert.alert('Added to cart', `${item.name} is ready for booking.`, [
+          try { addToCart(item, quantity); } catch (error) { Alert.alert('Cannot add item', error.message); return; }
+          Alert.alert('Added to cart', `${quantity} × ${item.name} added to your cart.`, [
             { text: 'Keep browsing' },
             { text: 'View cart', onPress: () => navigation.navigate('CustomerTabs', { screen: 'Cart' }) },
           ]);
@@ -188,7 +196,7 @@ export function CartScreen({ navigation }) {
 
       {cart.map((item) => (
         <View key={item.equipment_id} style={styles.cartCard}>
-          <View style={styles.cartEmoji}><Text style={{ fontSize: 31 }}>{item.image_ref}</Text></View>
+          <View style={styles.cartEmoji}><EquipmentImage item={item} fallbackStyle={{ fontSize: 31 }} /></View>
           <View style={styles.cartBody}>
             <Text style={styles.cartName}>{item.name}</Text>
             <Money value={item.daily_rate} />
@@ -196,7 +204,7 @@ export function CartScreen({ navigation }) {
               <Pressable onPress={() => updateCartQuantity(item.equipment_id, item.quantity - 1)} style={styles.smallQty}><Text>−</Text></Pressable>
               <Text style={styles.inlineQtyValue}>{item.quantity}</Text>
               <Pressable onPress={() => updateCartQuantity(item.equipment_id, item.quantity + 1)} style={styles.smallQty}><Text>+</Text></Pressable>
-              <Pressable onPress={() => removeFromCart(item.equipment_id)}><Text style={styles.remove}>Remove</Text></Pressable>
+              <Pressable onPress={() => Alert.alert('Remove from cart?', item.name, [{ text: 'Keep', style: 'cancel' }, { text: 'Remove', style: 'destructive', onPress: () => { removeFromCart(item.equipment_id); Alert.alert('Removed', 'The item was removed from your cart.'); } }])}><Text style={styles.remove}>Remove</Text></Pressable>
             </View>
           </View>
         </View>
@@ -212,6 +220,7 @@ export function CartScreen({ navigation }) {
   );
 }
 
+// Validate user input first; check SQLite stock before building the checkout draft.
 export function BookingScreen({ navigation }) {
   const { db, cart, setBookingDraft } = useApp();
   const [startDate, setStartDate] = useState(DEFAULT_START_DATE);
@@ -223,10 +232,10 @@ export function BookingScreen({ navigation }) {
 
   async function continueToCheckout() {
     const nextErrors = {};
-    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+    if (!cart.length) { Alert.alert('Empty cart', 'Add equipment before booking.'); return; }
     const days = rentalDays(startDate, endDate);
-    if (!datePattern.test(startDate)) nextErrors.startDate = 'Use YYYY-MM-DD.';
-    if (!datePattern.test(endDate) || !Number.isFinite(days) || days < 1) nextErrors.endDate = 'End date must be on or after the start date.';
+    if (!validDate(startDate) || startDate < localToday()) nextErrors.startDate = 'Enter a real date, today or later (YYYY-MM-DD).';
+    if (!validDate(endDate) || !Number.isFinite(days) || days < 1) nextErrors.endDate = 'End date must be on or after the start date.';
     if (!contact.trim()) nextErrors.contact = 'Contact information is required.';
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length) return;
@@ -296,6 +305,7 @@ function SummaryRow({ label, value, last }) {
   return <View style={[styles.summaryRow, last && { borderBottomWidth: 0 }]}><Text style={styles.summaryLabel}>{label}</Text><Text style={styles.summaryValue}>{value}</Text></View>;
 }
 
+// Demonstration payment records a selected method, never an actual charge.
 export function PaymentScreen({ navigation }) {
   const { db, bookingDraft, clearCart, refreshRentals, setBookingDraft } = useApp();
   const [method, setMethod] = useState('Cash on pickup');
@@ -304,7 +314,7 @@ export function PaymentScreen({ navigation }) {
   const methods = ['Cash on pickup', 'GCash demonstration', 'Bank transfer demonstration'];
 
   async function confirmBooking() {
-    if (!bookingDraft) return;
+    if (!bookingDraft || saving) return;
     setSaving(true);
     try {
       const result = await createReservation(db, { ...bookingDraft, paymentMethod: method });
@@ -345,7 +355,7 @@ export function PaymentScreen({ navigation }) {
         </Pressable>
       ))}
       <View style={styles.warningBox}><Text style={styles.warningTitle}>Demonstration only</Text><Text style={styles.warningText}>No card, GCash account, bank account, or payment gateway is connected.</Text></View>
-      <PrimaryButton title="Confirm reservation" onPress={confirmBooking} loading={saving} />
+      <PrimaryButton title="Confirm reservation" onPress={confirmBooking} loading={saving} disabled={!bookingDraft} />
     </ScrollView>
   );
 }
@@ -377,11 +387,32 @@ export function MyRentalsScreen({ navigation }) {
 }
 
 export function RentalDetailsScreen({ navigation, route }) {
-  const { db } = useApp();
+  const { db, refreshRentals } = useApp();
+  const [contact, setContact] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
   const [data, setData] = useState(null);
-  useEffect(() => { getRentalDetails(db, route.params.reservationId).then(setData); }, [db, route.params.reservationId]);
+  const [loaded, setLoaded] = useState(false);
+  const loadDetails = useCallback(async () => {
+    try {
+      const next = await getRentalDetails(db, route.params.reservationId);
+      setData(next); setContact(next.reservation?.booking_contact || ''); setNote(next.reservation?.event_note || '');
+    } catch (error) { Alert.alert('Could not load rental', error.message); }
+    finally { setLoaded(true); }
+  }, [db, route.params.reservationId]);
+  useFocusEffect(useCallback(() => { loadDetails(); }, [loadDetails]));
+  async function changeBooking(cancel = false) {
+    setBusy(true);
+    try {
+      if (cancel) await updateReservationStatus(db, route.params.reservationId, 'cancelled');
+      else await updateReservationContact(db, route.params.reservationId, contact, note);
+      await loadDetails(); await refreshRentals();
+      Alert.alert(cancel ? 'Reservation cancelled' : 'Details saved', cancel ? 'Reserved stock has been released.' : 'Your contact and event note have been updated.');
+    } catch (error) { Alert.alert('Could not update booking', error.message); }
+    finally { setBusy(false); }
+  }
   useEffect(() => { if (data?.reservation) screenTitle(navigation, data.reservation.booking_code); }, [data, navigation]);
-  if (!data?.reservation) return <View style={styles.center}><Text>Loading rental...</Text></View>;
+  if (!data?.reservation) return <EmptyState title={loaded ? 'Rental not found' : 'Loading rental…'} message={loaded ? 'The reservation is unavailable.' : 'Please wait.'} action={loaded ? 'Go back' : undefined} onAction={() => navigation.goBack()} />;
   const { reservation, items } = data;
 
   return (
@@ -398,23 +429,37 @@ export function RentalDetailsScreen({ navigation, route }) {
         <SummaryRow label="Event note" value={reservation.event_note || 'None'} last />
       </View>
       <SectionTitle title="Reserved equipment" />
-      {items.map((item) => <View key={item.item_id} style={styles.lineItem}><Text style={styles.lineItemName}>{item.image_ref} {item.name} x{item.quantity}</Text><Money value={item.line_total} /></View>)}
+      {items.map((item) => (
+        <View key={item.item_id} style={styles.lineItem}>
+          <EquipmentImage item={item} style={{ width: 36, height: 36, marginRight: 8 }} fallbackStyle={{ fontSize: 24, marginRight: 8 }} />
+          <Text style={styles.lineItemName}>{item.name} x{item.quantity}</Text>
+          <Money value={item.line_total} />
+        </View>
+      ))}
       <View style={styles.grandTotal}><Text style={styles.grandTotalLabel}>Total</Text><Money value={reservation.total_amount} style={{ fontSize: 26 }} /></View>
+      {route.params?.viewer !== 'management' && reservation.status === 'pending' && <>
+        <SectionTitle title="Edit booking details" />
+        <Field label="Contact" value={contact} onChangeText={setContact} />
+        <Field label="Event note" value={note} onChangeText={setNote} multiline />
+        <PrimaryButton title="Save details" loading={busy} onPress={() => changeBooking()} />
+      </>}
+      {route.params?.viewer !== 'management' && ['pending', 'confirmed'].includes(reservation.status) && <PrimaryButton title="Cancel reservation" variant="danger" disabled={busy} style={{ marginTop: 12 }}
+        onPress={() => Alert.alert('Cancel reservation?', 'This will release all reserved equipment.', [{ text: 'Keep booking', style: 'cancel' }, { text: 'Cancel reservation', style: 'destructive', onPress: () => changeBooking(true) }])} />}
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: colors.background },
-  pageContent: { padding: 18, paddingBottom: 38 },
-  listContent: { padding: 18, paddingBottom: 38 },
-  formContent: { padding: 20, paddingBottom: 40 },
+  pageContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 18, paddingBottom: 38 },
+  listContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 18, paddingBottom: 38 },
+  formContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 20, paddingBottom: 40 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background },
   hero: { backgroundColor: colors.navy, borderRadius: radius.large, padding: 22, marginBottom: 18, overflow: 'hidden' },
   heroTop: { flexDirection: 'row', justifyContent: 'space-between' },
   heroEyebrow: { color: '#8DDFD7', fontWeight: '900', letterSpacing: 1, fontSize: 10 },
   heroTitle: { color: '#FFFFFF', fontSize: 29, fontWeight: '900', lineHeight: 34, marginTop: 8 },
-  heroEmoji: { fontSize: 47 },
+  heroEmoji: { fontSize: 32, marginLeft: 4, flexShrink: 1 },
   heroText: { color: '#C8D6E5', fontSize: 14, lineHeight: 20, marginTop: 12, marginBottom: 18 },
   heroButton: { alignSelf: 'flex-start', minWidth: 170 },
   statRow: { flexDirection: 'row', gap: 12, marginBottom: 25 },
@@ -432,8 +477,8 @@ const styles = StyleSheet.create({
   chipText: { color: colors.muted, fontWeight: '700', fontSize: 12 },
   chipTextActive: { color: '#FFFFFF' },
   resultCount: { color: colors.muted, fontSize: 12, marginBottom: 10 },
-  detailsContent: { padding: 20, paddingBottom: 40 },
-  detailsVisual: { height: 230, borderRadius: radius.large, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
+  detailsContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 20, paddingBottom: 40 },
+  detailsVisual: { height: 250, overflow: 'hidden', borderRadius: radius.large, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
   detailsEmoji: { fontSize: 100 },
   detailsCategory: { color: colors.tealDark, fontWeight: '900', letterSpacing: 1, fontSize: 11, marginTop: 22, textTransform: 'uppercase' },
   detailsTitle: { color: colors.text, fontWeight: '900', fontSize: 28, marginTop: 4 },
@@ -452,13 +497,13 @@ const styles = StyleSheet.create({
   pageHeading: { color: colors.text, fontSize: 25, fontWeight: '900', marginBottom: 5 },
   pageLead: { color: colors.muted, fontSize: 14, lineHeight: 20, marginBottom: 20 },
   cartCard: { flexDirection: 'row', backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, borderRadius: radius.medium, padding: 13, marginBottom: 12 },
-  cartEmoji: { width: 70, height: 76, borderRadius: 13, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
+  cartEmoji: { width: 72, height: 86, flexShrink: 0, overflow: 'hidden', borderRadius: 13, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
   cartBody: { flex: 1, paddingLeft: 13 },
   cartName: { color: colors.text, fontSize: 15, fontWeight: '900', marginBottom: 5 },
   inlineQty: { flexDirection: 'row', alignItems: 'center', marginTop: 9 },
   smallQty: { width: 30, height: 28, borderRadius: 8, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' },
   inlineQtyValue: { width: 35, textAlign: 'center', fontWeight: '800' },
-  remove: { color: colors.danger, fontWeight: '700', fontSize: 12, marginLeft: 15 },
+  remove: { color: colors.danger, fontWeight: '700', fontSize: 12, marginLeft: 8 },
   totalBox: { backgroundColor: colors.surface, borderRadius: radius.medium, padding: 18, marginVertical: 10, borderWidth: 1, borderColor: colors.border },
   totalLabel: { color: colors.muted, marginBottom: 5 },
   totalNote: { color: colors.muted, fontSize: 11, marginTop: 7 },
@@ -485,7 +530,7 @@ const styles = StyleSheet.create({
   warningBox: { backgroundColor: '#FFF6DE', borderRadius: radius.medium, padding: 16, marginVertical: 10, marginBottom: 20 },
   warningTitle: { color: '#875C00', fontWeight: '900' },
   warningText: { color: '#875C00', lineHeight: 19, fontSize: 12, marginTop: 5 },
-  successContent: { flexGrow: 1, alignItems: 'center', justifyContent: 'center', padding: 28 },
+  successContent: { width: '100%', maxWidth: 900, alignSelf: 'center', flexGrow: 1, alignItems: 'center', justifyContent: 'center', padding: 28 },
   successCircle: { width: 82, height: 82, borderRadius: 41, backgroundColor: colors.mint, alignItems: 'center', justifyContent: 'center' },
   successCheck: { color: colors.success, fontSize: 41, fontWeight: '900' },
   successTitle: { color: colors.text, fontSize: 27, fontWeight: '900', marginTop: 20 },

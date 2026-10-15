@@ -1,6 +1,6 @@
+import { Alert } from './feedback';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Alert,
   FlatList,
   Pressable,
   RefreshControl,
@@ -17,6 +17,7 @@ import {
   getSupplierReservations,
   saveEquipment,
   updateReservationStatus,
+  nextStatuses,
 } from './database';
 import { EmptyState, EquipmentCard, Field, Money, PrimaryButton, StatusPill } from './components';
 import { colors, radius, shadow } from './theme';
@@ -26,7 +27,7 @@ export function SupplierDashboardScreen({ navigation }) {
   const [reservations, setReservations] = useState([]);
 
   useFocusEffect(useCallback(() => {
-    getSupplierReservations(db).then(setReservations);
+    getSupplierReservations(db).then(setReservations).catch(error => Alert.alert('Could not load reservations', error.message));
   }, [db]));
 
   const pending = reservations.filter((r) => r.status === 'pending').length;
@@ -72,7 +73,7 @@ function Stat({ value, label }) {
 export function ManageEquipmentScreen({ navigation }) {
   const { equipment, db, refreshEquipment } = useApp();
   const [refreshing, setRefreshing] = useState(false);
-  useFocusEffect(useCallback(() => { refreshEquipment(); }, [refreshEquipment]));
+  useFocusEffect(useCallback(() => { refreshEquipment().catch(error => Alert.alert('Could not refresh', error.message)); }, [refreshEquipment]));
 
   function askDelete(item) {
     Alert.alert('Remove equipment?', `${item.name} will be deleted if it has no active or future bookings.`, [
@@ -82,6 +83,7 @@ export function ManageEquipmentScreen({ navigation }) {
           try {
             await deleteEquipment(db, item.equipment_id);
             await refreshEquipment();
+            Alert.alert('Equipment removed', 'The listing was removed from the catalog. Historical bookings are preserved.');
           } catch (error) {
             Alert.alert('Cannot remove equipment', error.message);
           }
@@ -99,7 +101,7 @@ export function ManageEquipmentScreen({ navigation }) {
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await refreshEquipment(); setRefreshing(false); }} />}
       ListHeaderComponent={
         <View style={styles.listHeader}>
-          <View style={{ flex: 1 }}><Text style={styles.pageTitle}>Equipment CRUD</Text><Text style={styles.pageLead}>Listings saved on this device.</Text></View>
+          <View style={{ flex: 1 }}><Text style={styles.pageTitle}>Equipment catalog</Text><Text style={styles.pageLead}>Listings saved on this device.</Text></View>
           <Pressable onPress={() => navigation.getParent()?.navigate('EquipmentForm')} style={styles.addButton}><Text style={styles.addButtonText}>+ Add</Text></Pressable>
         </View>
       }
@@ -117,6 +119,7 @@ export function ManageEquipmentScreen({ navigation }) {
   );
 }
 
+// One controlled form supports both CREATE and UPDATE by equipment ID.
 export function EquipmentFormScreen({ navigation, route }) {
   const { db, refreshEquipment } = useApp();
   const equipmentId = route.params?.equipmentId;
@@ -129,7 +132,7 @@ export function EquipmentFormScreen({ navigation, route }) {
     if (equipmentId) {
       getEquipmentById(db, equipmentId).then((item) => {
         if (item) setForm({ name: item.name, category: item.category, description: item.description, dailyRate: String(item.daily_rate), totalQuantity: String(item.total_quantity), imageRef: item.image_ref || '🎪' });
-      });
+      }).catch(error => Alert.alert('Could not load listing', error.message));
     }
   }, [db, equipmentId, navigation]);
 
@@ -140,7 +143,7 @@ export function EquipmentFormScreen({ navigation, route }) {
     if (!form.name.trim()) next.name = 'Equipment name is required.';
     if (!form.category.trim()) next.category = 'Category is required.';
     if (!form.description.trim()) next.description = 'Description is required.';
-    if (!form.dailyRate || Number(form.dailyRate) < 0) next.dailyRate = 'Enter a valid daily rate.';
+    if (!form.dailyRate.trim() || !Number.isFinite(Number(form.dailyRate)) || Number(form.dailyRate) < 0) next.dailyRate = 'Enter a valid daily rate.';
     if (!form.totalQuantity || Number(form.totalQuantity) < 0 || !Number.isInteger(Number(form.totalQuantity))) next.totalQuantity = 'Enter a whole-number quantity.';
     setErrors(next);
     if (Object.keys(next).length) return;
@@ -162,7 +165,7 @@ export function EquipmentFormScreen({ navigation, route }) {
   return (
     <ScrollView style={styles.page} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
       <Text style={styles.pageTitle}>{equipmentId ? 'Update listing' : 'Create a listing'}</Text>
-      <Text style={styles.pageLead}>This form demonstrates supplier create and update operations.</Text>
+      <Text style={styles.pageLead}>Keep your equipment details and stock up to date.</Text>
       <Field label="Equipment name" value={form.name} onChangeText={(value) => setField('name', value)} error={errors.name} />
       <Field label="Category" value={form.category} onChangeText={(value) => setField('category', value)} error={errors.category} placeholder="Example: Audio" />
       <Field label="Description" value={form.description} onChangeText={(value) => setField('description', value)} error={errors.description} multiline />
@@ -174,25 +177,29 @@ export function EquipmentFormScreen({ navigation, route }) {
   );
 }
 
-export function SupplierReservationsScreen() {
+export function SupplierReservationsScreen({ navigation }) {
   const { db } = useApp();
   const [items, setItems] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [busy, setBusy] = useState(null);
 
-  const load = useCallback(async () => setItems(await getSupplierReservations(db)), [db]);
+  const load = useCallback(async () => { try { setItems(await getSupplierReservations(db)); } catch (error) { Alert.alert('Could not load reservations', error.message); } }, [db]);
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
   async function setStatus(reservationId, status) {
-    await updateReservationStatus(db, reservationId, status);
-    await load();
+    setBusy(reservationId);
+    try {
+      await updateReservationStatus(db, reservationId, status);
+      await load();
+      Alert.alert('Status updated', `Reservation is now ${status}.`);
+    } catch (error) { Alert.alert('Could not update status', error.message); }
+    finally { setBusy(null); }
   }
 
   function chooseStatus(item) {
-    Alert.alert(`Update ${item.booking_code}`, 'Choose the reservation status.', [
-      { text: 'Pending', onPress: () => setStatus(item.reservation_id, 'pending') },
-      { text: 'Confirmed', onPress: () => setStatus(item.reservation_id, 'confirmed') },
-      { text: 'Completed', onPress: () => setStatus(item.reservation_id, 'completed') },
-      { text: 'Cancelled', style: 'destructive', onPress: () => setStatus(item.reservation_id, 'cancelled') },
+    Alert.alert(`Update ${item.booking_code}`, 'Choose the next reservation status.', [
+      ...nextStatuses(item.status).map(status => ({ text: status[0].toUpperCase() + status.slice(1),
+        style: status === 'cancelled' ? 'destructive' : 'default', onPress: () => setStatus(item.reservation_id, status) })),
       { text: 'Close', style: 'cancel' },
     ]);
   }
@@ -204,14 +211,17 @@ export function SupplierReservationsScreen() {
       data={items}
       keyExtractor={(item) => String(item.reservation_id)}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await load(); setRefreshing(false); }} />}
-      ListHeaderComponent={<><Text style={styles.pageTitle}>Customer reservations</Text><Text style={styles.pageLead}>Update statuses to demonstrate the booking workflow.</Text></>}
+      ListHeaderComponent={<><Text style={styles.pageTitle}>Customer reservations</Text><Text style={styles.pageLead}>Review customer schedules and manage rental progress.</Text></>}
       renderItem={({ item }) => (
         <View style={styles.reservationCard}>
           <View style={styles.reservationTop}><Text style={styles.code}>{item.booking_code}</Text><StatusPill status={item.status} /></View>
           <Text style={styles.customer}>{item.customer_name}</Text>
           <Text style={styles.itemNames}>{item.item_names}</Text>
+          <Text style={styles.dates}>Contact: {item.booking_contact}</Text>
+          {!!item.event_note && <Text style={styles.dates}>{item.event_note}</Text>}
+          <Pressable onPress={() => navigation?.navigate('RentalDetails', { reservationId: item.reservation_id, viewer: 'management' })}><Text style={styles.editActionText}>View booking details ›</Text></Pressable>
           <Text style={styles.dates}>{item.start_date} → {item.end_date}</Text>
-          <View style={styles.reservationBottom}><Money value={item.total_amount} /><Pressable onPress={() => chooseStatus(item)} style={styles.statusButton}><Text style={styles.statusButtonText}>Update status</Text></Pressable></View>
+          <View style={styles.reservationBottom}><Money value={item.total_amount} /><Pressable disabled={busy === item.reservation_id || !nextStatuses(item.status).length} onPress={() => chooseStatus(item)} style={styles.statusButton}><Text style={styles.statusButtonText}>{busy === item.reservation_id ? 'Saving…' : nextStatuses(item.status).length ? 'Update status' : 'Closed'}</Text></Pressable></View>
         </View>
       )}
       ListEmptyComponent={<EmptyState icon="📋" title="No reservations yet" message="Create a customer booking first, then return here as the supplier." />}
@@ -221,9 +231,9 @@ export function SupplierReservationsScreen() {
 
 const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: colors.background },
-  content: { padding: 18, paddingBottom: 40 },
-  listContent: { padding: 18, paddingBottom: 40 },
-  formContent: { padding: 20, paddingBottom: 40 },
+  content: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 18, paddingBottom: 40 },
+  listContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 18, paddingBottom: 40 },
+  formContent: { width: '100%', maxWidth: 900, alignSelf: 'center', padding: 20, paddingBottom: 40 },
   supplierHero: { backgroundColor: colors.navy, borderRadius: radius.large, padding: 23 },
   heroEyebrow: { color: '#87DDD5', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
   heroTitle: { color: '#FFFFFF', fontSize: 28, lineHeight: 34, fontWeight: '900', marginTop: 8 },
